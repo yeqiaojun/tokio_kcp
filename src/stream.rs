@@ -42,6 +42,12 @@ impl Debug for KcpStream {
 }
 
 impl KcpStream {
+    /// Create a `KcpStream` with kcp-go compatible FEC options.
+    pub async fn dial_with_options(addr: SocketAddr, data_shards: usize, parity_shards: usize) -> KcpResult<KcpStream> {
+        let config = KcpConfig::default().with_fec(data_shards, parity_shards);
+        KcpStream::connect(&config, addr).await
+    }
+
     /// Create a `KcpStream` connecting to `addr`
     ///
     /// NOTE: `conv` will be randomly generated
@@ -105,8 +111,7 @@ impl KcpStream {
 
     /// `send` data in `buf`
     pub fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<KcpResult<usize>> {
-        // Mutex doesn't have poll_lock, spinning on it.
-        let mut kcp = self.session.kcp_socket().lock();
+        let mut kcp = self.session.lock_socket();
         let result = ready!(kcp.poll_send(cx, buf));
         self.session.notify();
         result.into()
@@ -131,8 +136,7 @@ impl KcpStream {
                 return Ok(copy_length).into();
             }
 
-            // Mutex doesn't have poll_lock, spinning on it.
-            let mut kcp = self.session.kcp_socket().lock();
+            let mut kcp = self.session.lock_socket();
 
             // Try to read from KCP
             // 1. Read directly with user provided `buf`
@@ -202,8 +206,7 @@ impl AsyncWrite for KcpStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Mutex doesn't have poll_lock, spinning on it.
-        let mut kcp = self.session.kcp_socket().lock();
+        let mut kcp = self.session.lock_socket();
         match kcp.flush() {
             Ok(..) => {
                 self.session.notify();
@@ -222,7 +225,7 @@ impl AsyncWrite for KcpStream {
 #[cfg(unix)]
 impl std::os::unix::io::AsRawFd for KcpStream {
     fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
-        let kcp_socket = self.session.kcp_socket().lock();
+        let kcp_socket = self.session.lock_socket();
         kcp_socket.udp_socket().as_raw_fd()
     }
 }
@@ -230,7 +233,7 @@ impl std::os::unix::io::AsRawFd for KcpStream {
 #[cfg(windows)]
 impl std::os::windows::io::AsRawSocket for KcpStream {
     fn as_raw_socket(&self) -> std::os::windows::prelude::RawSocket {
-        let kcp_socket = self.session.kcp_socket().lock();
+        let kcp_socket = self.session.lock_socket();
         kcp_socket.udp_socket().as_raw_socket()
     }
 }

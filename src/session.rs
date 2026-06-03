@@ -1,6 +1,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::{self, Debug},
+    io::ErrorKind,
     net::SocketAddr,
     ops::Deref,
     sync::{
@@ -11,31 +12,28 @@ use std::{
 };
 
 use byte_string::ByteStr;
-use kcp::KcpResult;
+use kcp::{Error as KcpError, KcpResult};
 use log::{error, trace};
 use spin::Mutex as SpinMutex;
-use tokio::{
-    net::UdpSocket,
-    sync::{mpsc, Notify},
-    time::{self, Instant},
-};
+use spin::MutexGuard as SpinMutexGuard;
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
 
-use crate::{skcp::KcpSocket, KcpConfig};
+use crate::{fec, scheduler::session_scheduler, skcp::KcpSocket, KcpConfig};
 
 pub struct KcpSession {
     socket: SpinMutex<KcpSocket>,
     closed: AtomicBool,
-    session_expire: Option<Duration>,
-    session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
+    session_expire_ms: u64,
+    session_close_notifier: Option<(mpsc::UnboundedSender<SocketAddr>, SocketAddr)>,
     input_tx: mpsc::Sender<Vec<u8>>,
-    notifier: Notify,
+    io_task_handle: SpinMutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for KcpSession {
     fn drop(&mut self) {
         trace!(
             "[SESSION] KcpSession conv {} is dropping, closed? {}",
-            self.socket.lock().conv(),
+            self.lock_socket().conv(),
             self.closed.load(Ordering::Acquire),
         );
     }
@@ -43,13 +41,13 @@ impl Drop for KcpSession {
 
 impl Debug for KcpSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let socket = self.lock_socket();
         f.debug_struct("KcpSession")
-            .field("socket", self.socket.lock().deref())
+            .field("socket", socket.deref())
             .field("closed", &self.closed.load(Ordering::Relaxed))
-            .field("session_expire", &self.session_expire)
+            .field("session_expire_ms", &self.session_expire_ms)
             .field("session_close_notifier", &self.session_close_notifier)
             .field("input_tx", &self.input_tx)
-            .field("notifier", &self.notifier)
             .finish()
     }
 }
@@ -58,26 +56,31 @@ impl KcpSession {
     fn new(
         socket: KcpSocket,
         session_expire: Option<Duration>,
-        session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
+        session_close_notifier: Option<(mpsc::UnboundedSender<SocketAddr>, SocketAddr)>,
         input_tx: mpsc::Sender<Vec<u8>>,
     ) -> KcpSession {
+        let session_expire_ms = if session_close_notifier.is_some() {
+            session_expire.map_or(0, |expire| expire.as_millis() as u64)
+        } else {
+            0
+        };
+
         KcpSession {
             socket: SpinMutex::new(socket),
             closed: AtomicBool::new(false),
-            session_expire,
+            session_expire_ms,
             session_close_notifier,
             input_tx,
-            notifier: Notify::new(),
+            io_task_handle: SpinMutex::new(None),
         }
     }
 
     pub fn new_shared(
         socket: KcpSocket,
         session_expire: Option<Duration>,
-        session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
+        session_close_notifier: Option<(mpsc::UnboundedSender<SocketAddr>, SocketAddr)>,
     ) -> Arc<KcpSession> {
         let is_client = session_close_notifier.is_none();
-
         let (input_tx, mut input_rx) = mpsc::channel(64);
 
         let udp_socket = socket.udp_socket().clone();
@@ -108,18 +111,48 @@ impl KcpSession {
                                 Ok(n) => {
                                     let input_buffer = &input_buffer[..n];
 
-                                    if input_buffer.len() < kcp::KCP_OVERHEAD {
-                                        error!("packet too short, received {} bytes, but at least {} bytes",
-                                               input_buffer.len(),
-                                               kcp::KCP_OVERHEAD);
+                                    let input_conv = if let Some(payload) = fec::data_payload(input_buffer) {
+                                        if payload.len() < kcp::KCP_OVERHEAD {
+                                            error!("packet too short, received {} bytes, but at least {} bytes",
+                                                   payload.len(),
+                                                   kcp::KCP_OVERHEAD);
+                                            continue;
+                                        }
+
+                                        Some(kcp::get_conv(payload))
+                                    } else if fec::is_parity_packet(input_buffer) {
+                                        None
+                                    } else {
+                                        if input_buffer.len() < kcp::KCP_OVERHEAD {
+                                            error!("packet too short, received {} bytes, but at least {} bytes",
+                                                   input_buffer.len(),
+                                                   kcp::KCP_OVERHEAD);
+                                            continue;
+                                        }
+
+                                        Some(kcp::get_conv(input_buffer))
+                                    };
+
+                                    if input_conv.is_none() {
+                                        let mut socket = session.lock_socket();
+                                        match socket.input(input_buffer) {
+                                            Ok(true) => {
+                                                trace!("[SESSION] UDP input {} bytes and waked sender/receiver", n);
+                                            }
+                                            Ok(false) => {}
+                                            Err(err) => {
+                                                error!("[SESSION] UDP input {} bytes error: {}, input buffer {:?}",
+                                                       n, err, ByteStr::new(input_buffer));
+                                            }
+                                        }
                                         continue;
                                     }
 
-                                    let input_conv = kcp::get_conv(input_buffer);
+                                    let input_conv = input_conv.unwrap();
                                     trace!("[SESSION] UDP recv {} bytes, conv: {}, going to input {:?}",
                                            n, input_conv, ByteStr::new(input_buffer));
 
-                                    let mut socket = session.socket.lock();
+                                    let mut socket = session.lock_socket();
 
                                     // Server may allocate another conv for this client.
                                     if !socket.waiting_conv() && socket.conv() != input_conv {
@@ -144,7 +177,7 @@ impl KcpSession {
                         // bytes received from listener socket
                         input_opt = input_rx.recv() => {
                             if let Some(input_buffer) = input_opt {
-                                let mut socket = session.socket.lock();
+                                let mut socket = session.lock_socket();
                                 match socket.input(&input_buffer) {
                                     Ok(waked) => {
                                         // trace!("[SESSION] UDP input {} bytes from channel {:?}",
@@ -163,95 +196,18 @@ impl KcpSession {
                 }
             })
         };
-
-        // Per-session updater
-        {
-            let session = session.clone();
-            tokio::spawn(async move {
-                while !session.closed.load(Ordering::Relaxed) {
-                    let next = {
-                        let mut socket = session.socket.lock();
-
-                        let is_closed = session.closed.load(Ordering::Acquire);
-                        if is_closed && socket.can_close() {
-                            trace!("[SESSION] KCP session closing");
-                            break;
-                        }
-
-                        // server socket expires
-                        if !is_client {
-                            // If this is a server stream, close it automatically after a period of time
-                            let last_update_time = socket.last_update_time();
-                            let elapsed = last_update_time.elapsed();
-
-                            if let Some(session_expire) = session.session_expire {
-                                if elapsed > session_expire {
-                                    if elapsed > session_expire * 2 {
-                                        // Force close. Client may have already gone.
-                                        trace!(
-                                            "[SESSION] force close inactive session, conv: {}, last_update: {}s ago",
-                                            socket.conv(),
-                                            elapsed.as_secs()
-                                        );
-                                        break;
-                                    }
-
-                                    if !is_closed {
-                                        trace!(
-                                            "[SESSION] closing inactive session, conv: {}, last_update: {}s ago",
-                                            socket.conv(),
-                                            elapsed.as_secs()
-                                        );
-                                        session.closed.store(true, Ordering::Release);
-                                    }
-                                }
-                            }
-                        }
-
-                        // If window is full, flush it immediately
-                        if socket.need_flush() {
-                            let _ = socket.flush();
-                        }
-
-                        match socket.update() {
-                            Ok(next_next) => Instant::from_std(next_next),
-                            Err(err) => {
-                                error!("[SESSION] KCP update failed, error: {}", err);
-                                Instant::now() + Duration::from_millis(10)
-                            }
-                        }
-                    };
-
-                    tokio::select! {
-                        _ = time::sleep_until(next) => {},
-                        _ = session.notifier.notified() => {},
-                    }
-                }
-
-                {
-                    // Close the socket.
-                    // Wake all pending tasks and let all send/recv return EOF
-
-                    let mut socket = session.socket.lock();
-                    socket.close();
-                }
-
-                if let Some((ref notifier, peer_addr)) = session.session_close_notifier {
-                    let _ = notifier.send(peer_addr).await;
-                }
-
-                session.closed.store(true, Ordering::Release);
-                io_task_handle.abort();
-
-                trace!("[SESSION] KCP session closed");
-            });
-        }
+        *session.io_task_handle.lock() = Some(io_task_handle);
+        session_scheduler().register(session.clone());
 
         session
     }
 
     pub fn kcp_socket(&self) -> &SpinMutex<KcpSocket> {
         &self.socket
+    }
+
+    pub(crate) fn lock_socket(&self) -> SpinMutexGuard<'_, KcpSocket> {
+        self.socket.lock()
     }
 
     pub fn close(&self) {
@@ -264,12 +220,88 @@ impl KcpSession {
     }
 
     pub async fn conv(&self) -> u32 {
-        let socket = self.socket.lock();
+        let socket = self.lock_socket();
         socket.conv()
     }
 
-    pub fn notify(&self) {
-        self.notifier.notify_one();
+    #[inline]
+    pub fn notify(&self) {}
+
+    pub(crate) fn poll_scheduler_tick(&self, now_ms: u64) -> Option<u64> {
+        match self.drive_update(now_ms) {
+            Some(next_update_ms) => Some(next_update_ms),
+            None => {
+                self.finalize();
+                None
+            }
+        }
+    }
+
+    fn drive_update(&self, now_ms: u64) -> Option<u64> {
+        let mut socket = self.lock_socket();
+
+        let is_closed = self.closed.load(Ordering::Acquire);
+        if is_closed && socket.can_close() {
+            trace!("[SESSION] KCP session closing");
+            return None;
+        }
+
+        let expire_ms = self.session_expire_ms;
+        if expire_ms != 0 {
+            let elapsed_ms = now_ms.saturating_sub(socket.last_update_ms());
+
+            if elapsed_ms > expire_ms {
+                if elapsed_ms > expire_ms.saturating_mul(2) {
+                    trace!(
+                        "[SESSION] force close inactive session, conv: {}, last_update: {}s ago",
+                        socket.conv(),
+                        elapsed_ms / 1000
+                    );
+                    return None;
+                }
+
+                if !is_closed {
+                    trace!(
+                        "[SESSION] closing inactive session, conv: {}, last_update: {}s ago",
+                        socket.conv(),
+                        elapsed_ms / 1000
+                    );
+                    self.closed.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        let next_delay = match socket.update_at(now_ms) {
+            Ok(next_delay) => next_delay,
+            Err(KcpError::IoError(err)) if err.kind() == ErrorKind::BrokenPipe => {
+                trace!("[SESSION] KCP output closed");
+                return None;
+            }
+            Err(err) => {
+                error!("[SESSION] KCP update failed, error: {}", err);
+                Duration::from_millis(10)
+            }
+        };
+
+        Some(now_ms.saturating_add(next_delay.as_millis() as u64))
+    }
+
+    fn finalize(&self) {
+        {
+            let mut socket = self.lock_socket();
+            socket.close();
+        }
+
+        if let Some(io_task_handle) = self.io_task_handle.lock().take() {
+            io_task_handle.abort();
+        }
+
+        if let Some((notifier, peer_addr)) = &self.session_close_notifier {
+            let _ = notifier.send(*peer_addr);
+        }
+
+        self.closed.store(true, Ordering::Release);
+        trace!("[SESSION] KCP session closed");
     }
 }
 
@@ -315,6 +347,10 @@ impl KcpSessionManager {
         self.sessions.remove(&peer_addr);
     }
 
+    pub fn get(&self, peer_addr: SocketAddr) -> Option<Arc<KcpSession>> {
+        self.sessions.get(&peer_addr).map(|session| session.0.clone())
+    }
+
     pub async fn get_or_create(
         &mut self,
         config: &KcpConfig,
@@ -322,7 +358,7 @@ impl KcpSessionManager {
         sn: u32,
         udp: &Arc<UdpSocket>,
         peer_addr: SocketAddr,
-        session_close_notifier: &mpsc::Sender<SocketAddr>,
+        session_close_notifier: &mpsc::UnboundedSender<SocketAddr>,
     ) -> KcpResult<(Arc<KcpSession>, bool)> {
         match self.sessions.entry(peer_addr) {
             Entry::Occupied(mut occ) => {

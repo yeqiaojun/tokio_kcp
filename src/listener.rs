@@ -16,7 +16,7 @@ use tokio::{
     time,
 };
 
-use crate::{config::KcpConfig, session::KcpSessionManager, stream::KcpStream};
+use crate::{config::KcpConfig, fec, session::KcpSessionManager, stream::KcpStream};
 
 #[derive(Debug)]
 pub struct KcpListener {
@@ -32,6 +32,16 @@ impl Drop for KcpListener {
 }
 
 impl KcpListener {
+    /// Create an `KcpListener` with kcp-go compatible FEC options.
+    pub async fn listen_with_options<A: ToSocketAddrs>(
+        addr: A,
+        data_shards: usize,
+        parity_shards: usize,
+    ) -> KcpResult<KcpListener> {
+        let config = KcpConfig::default().with_fec(data_shards, parity_shards);
+        KcpListener::bind(config, addr).await
+    }
+
     /// Create an `KcpListener` bound to `addr`
     pub async fn bind<A: ToSocketAddrs>(config: KcpConfig, addr: A) -> KcpResult<KcpListener> {
         let udp = UdpSocket::bind(addr).await?;
@@ -40,12 +50,14 @@ impl KcpListener {
 
     /// Create a `KcpListener` from an existed `UdpSocket`
     pub async fn from_socket(config: KcpConfig, udp: UdpSocket) -> KcpResult<KcpListener> {
+        config.validate()?;
+
         let udp = Arc::new(udp);
         let server_udp = udp.clone();
 
         let (accept_tx, accept_rx) = mpsc::channel(1024 /* backlogs */);
         let task_watcher = tokio::spawn(async move {
-            let (close_tx, mut close_rx) = mpsc::channel(64);
+            let (close_tx, mut close_rx) = mpsc::unbounded_channel();
 
             let mut sessions = KcpSessionManager::new();
             let mut packet_buffer = [0u8; 65536];
@@ -68,23 +80,41 @@ impl KcpListener {
 
                                 trace!("received peer: {}, {:?}", peer_addr, ByteStr::new(packet));
 
-                                if packet.len() < kcp::KCP_OVERHEAD {
-                                    error!("packet too short, received {} bytes, but at least {} bytes",
-                                           packet.len(),
-                                           kcp::KCP_OVERHEAD);
+                                if config.fec.enabled() && fec::is_parity_packet(packet) {
+                                    if let Some(session) = sessions.get(peer_addr) {
+                                        if session.input(packet).await.is_err() {
+                                            trace!("[SESSION] KCP session is closing while listener tries to input");
+                                        }
+                                    }
                                     continue;
                                 }
 
-                                let mut conv = kcp::get_conv(packet);
-                                if conv == 0 {
-                                    // Allocate a conv for client.
-                                    conv = sessions.alloc_conv();
-                                    debug!("allocate {} conv for peer: {}", conv, peer_addr);
+                                let (conv, sn) = {
+                                    let is_fec_data = config.fec.enabled() && fec::is_data_packet(packet);
+                                    let kcp_packet = if is_fec_data {
+                                        fec::data_payload_mut(packet).unwrap()
+                                    } else {
+                                        &mut *packet
+                                    };
 
-                                    kcp::set_conv(packet, conv);
-                                }
+                                    if kcp_packet.len() < kcp::KCP_OVERHEAD {
+                                        error!("packet too short, received {} bytes, but at least {} bytes",
+                                               kcp_packet.len(),
+                                               kcp::KCP_OVERHEAD);
+                                        continue;
+                                    }
 
-                                let sn = kcp::get_sn(packet);
+                                    let mut conv = kcp::get_conv(kcp_packet);
+                                    if conv == 0 {
+                                        // Allocate a conv for client.
+                                        conv = sessions.alloc_conv();
+                                        debug!("allocate {} conv for peer: {}", conv, peer_addr);
+
+                                        kcp::set_conv(kcp_packet, conv);
+                                    }
+
+                                    (conv, kcp::get_sn(kcp_packet))
+                                };
 
                                 let session = match sessions.get_or_create(&config, conv, sn, &udp, peer_addr, &close_tx).await {
                                     Ok((s, created)) => {
@@ -151,8 +181,9 @@ impl KcpListener {
 
     pub fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<KcpResult<(KcpStream, SocketAddr)>> {
         self.accept_rx.poll_recv(cx).map(|op_res| {
-            op_res
-                .ok_or_else(|| KcpError::IoError(io::Error::new(ErrorKind::Other, "accept channel closed unexpectedly")))
+            op_res.ok_or_else(|| {
+                KcpError::IoError(io::Error::new(ErrorKind::Other, "accept channel closed unexpectedly"))
+            })
         })
     }
 
@@ -179,10 +210,11 @@ impl std::os::windows::io::AsRawSocket for KcpListener {
 #[cfg(test)]
 mod test {
     use futures_util::future;
+    use kcp::Error as KcpError;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::KcpListener;
-    use crate::{config::KcpConfig, stream::KcpStream};
+    use crate::{config::KcpConfig, fec::FEC_HEADER_SIZE_PLUS_SIZE, stream::KcpStream};
 
     #[tokio::test]
     async fn multi_echo() {
@@ -231,5 +263,40 @@ mod test {
         }
 
         future::join_all(vfut).await;
+    }
+
+    #[tokio::test]
+    async fn fec_echo() {
+        let _ = env_logger::try_init();
+
+        let mut listener = KcpListener::listen_with_options("127.0.0.1:0", 2, 1).await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 8192];
+            let n = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(&buffer[..n]).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let mut stream = KcpStream::dial_with_options(server_addr, 2, 1).await.unwrap();
+        stream.write_all(b"HELLO FEC").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buffer = [0u8; 1024];
+        let n = stream.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], b"HELLO FEC");
+    }
+
+    #[tokio::test]
+    async fn fec_rejects_mtu_too_small_for_header() {
+        let mut config = KcpConfig::default().with_fec(2, 1);
+        config.mtu = FEC_HEADER_SIZE_PLUS_SIZE;
+
+        match KcpListener::bind(config, "127.0.0.1:0").await {
+            Err(KcpError::IoError(err)) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected invalid input, got {:?}", other),
+        }
     }
 }

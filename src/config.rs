@@ -1,6 +1,10 @@
-use std::{io::Write, time::Duration};
+use std::{io, io::Write, time::Duration};
 
 use kcp::Kcp;
+
+use crate::fec::FEC_HEADER_SIZE_PLUS_SIZE;
+
+const MIN_KCP_MTU: usize = 50;
 
 /// Kcp Delay Config
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +62,47 @@ impl KcpNoDelayConfig {
     }
 }
 
+/// kcp-go compatible FEC config.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KcpFecConfig {
+    /// Number of data shards. `0` disables FEC.
+    pub data_shards: usize,
+    /// Number of parity shards. `0` disables FEC.
+    pub parity_shards: usize,
+}
+
+impl KcpFecConfig {
+    pub const fn new(data_shards: usize, parity_shards: usize) -> KcpFecConfig {
+        KcpFecConfig {
+            data_shards,
+            parity_shards,
+        }
+    }
+
+    pub const fn disabled() -> KcpFecConfig {
+        KcpFecConfig {
+            data_shards: 0,
+            parity_shards: 0,
+        }
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.data_shards > 0 && self.parity_shards > 0
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        if self.data_shards == 0 && self.parity_shards == 0 {
+            return Ok(());
+        }
+
+        if self.data_shards == 0 || self.parity_shards == 0 || self.data_shards + self.parity_shards > 256 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid FEC shards"));
+        }
+
+        Ok(())
+    }
+}
+
 /// Kcp Config
 #[derive(Debug, Clone, Copy)]
 pub struct KcpConfig {
@@ -77,6 +122,8 @@ pub struct KcpConfig {
     pub stream: bool,
     /// Allow recv 0 byte packet. KCP Segments with 0 byte data are skipped by default.
     pub allow_recv_empty_packet: bool,
+    /// kcp-go compatible FEC config. Disabled by default.
+    pub fec: KcpFecConfig,
 }
 
 impl Default for KcpConfig {
@@ -90,15 +137,46 @@ impl Default for KcpConfig {
             flush_acks_input: false,
             stream: false,
             allow_recv_empty_packet: false,
+            fec: KcpFecConfig::disabled(),
         }
     }
 }
 
 impl KcpConfig {
+    pub fn with_fec(mut self, data_shards: usize, parity_shards: usize) -> KcpConfig {
+        self.fec = KcpFecConfig::new(data_shards, parity_shards);
+        self
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        self.fec.validate()?;
+
+        let mtu = if self.fec.enabled() {
+            self.mtu
+                .checked_sub(FEC_HEADER_SIZE_PLUS_SIZE)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MTU too small for FEC header"))?
+        } else {
+            self.mtu
+        };
+
+        if mtu < MIN_KCP_MTU {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid MTU"));
+        }
+
+        Ok(())
+    }
+
     /// Applies config onto `Kcp`
     #[doc(hidden)]
     pub fn apply_config<W: Write>(&self, k: &mut Kcp<W>) {
-        k.set_mtu(self.mtu).expect("invalid MTU");
+        self.validate().expect("invalid KCP config");
+
+        let mtu = if self.fec.enabled() {
+            self.mtu.checked_sub(FEC_HEADER_SIZE_PLUS_SIZE).expect("invalid MTU")
+        } else {
+            self.mtu
+        };
+        k.set_mtu(mtu).expect("invalid MTU");
 
         k.set_nodelay(
             self.nodelay.nodelay,

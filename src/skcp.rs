@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::Arc,
     task::{Context, Poll, Waker},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use futures_util::future;
@@ -11,53 +11,63 @@ use kcp::{Error as KcpError, Kcp, KcpResult};
 use log::{error, trace};
 use tokio::{net::UdpSocket, sync::mpsc};
 
-use crate::{utils::now_millis, KcpConfig};
+use crate::{
+    fec::{self, FecDecoder, FecEncoder},
+    utils::now_millis_u64,
+    KcpConfig,
+};
+
+const OUTPUT_BACKLOG: usize = 2048;
 
 /// Writer for sending packets to the underlying UdpSocket
 struct UdpOutput {
-    socket: Arc<UdpSocket>,
-    target_addr: SocketAddr,
-    delay_tx: mpsc::UnboundedSender<Vec<u8>>,
+    post_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl UdpOutput {
     /// Create a new Writer for writing packets to UdpSocket
-    pub fn new(socket: Arc<UdpSocket>, target_addr: SocketAddr) -> UdpOutput {
-        let (delay_tx, mut delay_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    pub fn new(socket: Arc<UdpSocket>, target_addr: SocketAddr, config: &KcpConfig) -> io::Result<UdpOutput> {
+        let (post_tx, mut post_rx) = mpsc::channel::<Vec<u8>>(OUTPUT_BACKLOG);
+        let mut fec_encoder = if config.fec.enabled() {
+            Some(FecEncoder::new(config.fec.data_shards, config.fec.parity_shards)?)
+        } else {
+            None
+        };
 
-        {
-            let socket = socket.clone();
-            tokio::spawn(async move {
-                while let Some(buf) = delay_rx.recv().await {
-                    if let Err(err) = socket.send_to(&buf, target_addr).await {
-                        error!("[SEND] UDP delayed send failed, error: {}", err);
+        tokio::spawn(async move {
+            while let Some(buf) = post_rx.recv().await {
+                if let Some(fec_encoder) = &mut fec_encoder {
+                    match fec_encoder.encode(&buf) {
+                        Ok(encoded) => {
+                            for packet in encoded.packets {
+                                send_packet(&socket, target_addr, &packet).await;
+                            }
+                        }
+                        Err(err) => {
+                            error!("[SEND] FEC encode failed, error: {}", err);
+                        }
                     }
+                } else {
+                    send_packet(&socket, target_addr, &buf).await;
                 }
-            });
-        }
+            }
+        });
 
-        UdpOutput {
-            socket,
-            target_addr,
-            delay_tx,
-        }
+        Ok(UdpOutput { post_tx })
     }
 }
 
 impl Write for UdpOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.socket.try_send_to(buf, self.target_addr) {
-            Ok(n) => Ok(n),
-            Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-                // send return EAGAIN
-                // ignored as packet was lost in transmission
-                trace!("[SEND] UDP send EAGAIN, packet.size: {} bytes, delayed send", buf.len());
-
-                self.delay_tx.send(buf.to_owned()).expect("channel closed unexpectedly");
-
+        match self.post_tx.try_send(buf.to_owned()) {
+            Ok(()) => Ok(buf.len()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                trace!("[SEND] UDP output backlog full, dropped {} bytes", buf.len());
                 Ok(buf.len())
             }
-            Err(err) => Err(err),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(io::Error::new(ErrorKind::BrokenPipe, "UDP output task closed"))
+            }
         }
     }
 
@@ -66,10 +76,25 @@ impl Write for UdpOutput {
     }
 }
 
+async fn send_packet(socket: &UdpSocket, target_addr: SocketAddr, buf: &[u8]) {
+    match socket.try_send_to(buf, target_addr) {
+        Ok(..) => {}
+        Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
+            if let Err(err) = socket.send_to(buf, target_addr).await {
+                error!("[SEND] UDP send failed, error: {}", err);
+            }
+        }
+        Err(err) => {
+            error!("[SEND] UDP send failed, error: {}", err);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct KcpSocket {
     kcp: Kcp<UdpOutput>,
-    last_update: Instant,
+    last_update_ms: u64,
+    update_interval_ms: u64,
     socket: Arc<UdpSocket>,
     flush_write: bool,
     flush_ack_input: bool,
@@ -78,6 +103,7 @@ pub struct KcpSocket {
     pending_receiver: Option<Waker>,
     closed: bool,
     allow_recv_empty_packet: bool,
+    fec_decoder: Option<FecDecoder>,
 }
 
 impl KcpSocket {
@@ -88,7 +114,9 @@ impl KcpSocket {
         target_addr: SocketAddr,
         stream: bool,
     ) -> KcpResult<KcpSocket> {
-        let output = UdpOutput::new(socket.clone(), target_addr);
+        c.validate()?;
+
+        let output = UdpOutput::new(socket.clone(), target_addr, c)?;
         let mut kcp = if stream {
             Kcp::new_stream(conv, output)
         } else {
@@ -101,11 +129,13 @@ impl KcpSocket {
             kcp.input_conv();
         }
 
-        kcp.update(now_millis())?;
+        let now = now_millis_u64();
+        kcp.update(now as u32)?;
 
         Ok(KcpSocket {
             kcp,
-            last_update: Instant::now(),
+            last_update_ms: now,
+            update_interval_ms: c.nodelay.interval.clamp(10, 5000) as u64,
             socket,
             flush_write: c.flush_write,
             flush_ack_input: c.flush_acks_input,
@@ -114,11 +144,45 @@ impl KcpSocket {
             pending_receiver: None,
             closed: false,
             allow_recv_empty_packet: c.allow_recv_empty_packet,
+            fec_decoder: if c.fec.enabled() {
+                Some(FecDecoder::new(c.fec.data_shards, c.fec.parity_shards)?)
+            } else {
+                None
+            },
         })
     }
 
     /// Call every time you got data from transmission
     pub fn input(&mut self, buf: &[u8]) -> KcpResult<bool> {
+        if self.fec_decoder.is_some() && fec::is_fec_packet(buf) {
+            return self.input_fec(buf);
+        }
+
+        self.input_kcp(buf)
+    }
+
+    fn input_fec(&mut self, buf: &[u8]) -> KcpResult<bool> {
+        let mut waked = false;
+
+        if let Some(payload) = fec::data_payload(buf) {
+            waked |= self.input_kcp(payload)?;
+        }
+
+        let recovered = self
+            .fec_decoder
+            .as_mut()
+            .unwrap()
+            .decode(buf)
+            .map_err(KcpError::IoError)?;
+
+        for payload in recovered {
+            waked |= self.input_kcp(&payload)?;
+        }
+
+        Ok(waked)
+    }
+
+    fn input_kcp(&mut self, buf: &[u8]) -> KcpResult<bool> {
         match self.kcp.input(buf) {
             Ok(..) => {}
             Err(KcpError::ConvInconsistent(expected, actual)) => {
@@ -127,7 +191,7 @@ impl KcpSocket {
             }
             Err(err) => return Err(err),
         }
-        self.last_update = Instant::now();
+        self.last_update_ms = now_millis_u64();
 
         if self.flush_ack_input {
             self.kcp.flush_ack()?;
@@ -177,7 +241,7 @@ impl KcpSocket {
             self.kcp.flush()?;
         }
 
-        self.last_update = Instant::now();
+        self.last_update_ms = now_millis_u64();
 
         if self.flush_write {
             self.kcp.flush()?;
@@ -223,7 +287,7 @@ impl KcpSocket {
                         self.kcp.peeksize().unwrap_or(0),
                     );
                 } else {
-                    self.last_update = Instant::now();
+                    self.last_update_ms = now_millis_u64();
                     return Ok(n).into();
                 }
             }
@@ -245,13 +309,11 @@ impl KcpSocket {
 
     pub fn flush(&mut self) -> KcpResult<()> {
         self.kcp.flush()?;
-        self.last_update = Instant::now();
+        self.last_update_ms = now_millis_u64();
         Ok(())
     }
 
-    fn try_wake_pending_waker(&mut self) -> bool {
-        let mut waked = false;
-
+    fn try_wake_pending_sender(&mut self) -> bool {
         if self.pending_sender.is_some()
             && self.kcp.wait_snd() < self.kcp.snd_wnd() as usize
             && self.kcp.wait_snd() < self.kcp.rmt_wnd() as usize
@@ -260,31 +322,47 @@ impl KcpSocket {
             let waker = self.pending_sender.take().unwrap();
             waker.wake();
 
-            waked = true;
+            return true;
         }
 
+        false
+    }
+
+    fn try_wake_pending_receiver(&mut self) -> bool {
         if self.pending_receiver.is_some() {
             if let Ok(peek) = self.kcp.peeksize() {
                 if self.allow_recv_empty_packet || peek > 0 {
                     let waker = self.pending_receiver.take().unwrap();
                     waker.wake();
 
-                    waked = true;
+                    return true;
                 }
             }
         }
 
-        waked
+        false
     }
 
-    pub fn update(&mut self) -> KcpResult<Instant> {
-        let now = now_millis();
+    fn try_wake_pending_waker(&mut self) -> bool {
+        self.try_wake_pending_sender() | self.try_wake_pending_receiver()
+    }
+
+    pub fn update_at(&mut self, now_ms: u64) -> KcpResult<Duration> {
+        let now = now_ms as u32;
         self.kcp.update(now)?;
-        let next = self.kcp.check(now);
+        let next = if self.kcp.wait_snd() == 0 {
+            self.update_interval_ms
+        } else {
+            self.kcp.check(now) as u64
+        };
 
-        self.try_wake_pending_waker();
+        self.try_wake_pending_sender();
 
-        Ok(Instant::now() + Duration::from_millis(next as u64))
+        Ok(Duration::from_millis(next))
+    }
+
+    pub fn update(&mut self) -> KcpResult<Duration> {
+        self.update_at(now_millis_u64())
     }
 
     pub fn close(&mut self) {
@@ -321,13 +399,8 @@ impl KcpSocket {
         self.kcp.peeksize()
     }
 
-    pub fn last_update_time(&self) -> Instant {
-        self.last_update
-    }
-
-    pub fn need_flush(&self) -> bool {
-        (self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize)
-            && !self.kcp.waiting_conv()
+    pub fn last_update_ms(&self) -> u64 {
+        self.last_update_ms
     }
 }
 
@@ -337,11 +410,7 @@ mod test {
     use kcp::Error as KcpError;
     use log::trace;
     use std::sync::Arc;
-    use tokio::{
-        net::UdpSocket,
-        sync::Mutex,
-        time::{self, Instant},
-    };
+    use tokio::{net::UdpSocket, sync::Mutex, time};
 
     use super::KcpSocket;
     use crate::config::KcpConfig;
@@ -376,7 +445,7 @@ mod test {
                     let mut kcp = kcp1.lock().await;
                     let next = kcp.update().expect("update");
                     trace!("kcp1 next tick {:?}", next);
-                    time::sleep_until(Instant::from_std(next)).await;
+                    time::sleep(next).await;
                 }
             })
         };
@@ -388,7 +457,7 @@ mod test {
                     let mut kcp = kcp2.lock().await;
                     let next = kcp.update().expect("update");
                     trace!("kcp2 next tick {:?}", next);
-                    time::sleep_until(Instant::from_std(next)).await;
+                    time::sleep(next).await;
                 }
             })
         };
