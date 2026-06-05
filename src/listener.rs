@@ -1,5 +1,5 @@
 use std::{
-    io::{self, ErrorKind},
+    io,
     net::SocketAddr,
     sync::Arc,
     task::{Context, Poll},
@@ -172,8 +172,7 @@ impl KcpListener {
     pub async fn accept(&mut self) -> KcpResult<(KcpStream, SocketAddr)> {
         match self.accept_rx.recv().await {
             Some(s) => Ok(s),
-            None => Err(KcpError::IoError(io::Error::new(
-                ErrorKind::Other,
+            None => Err(KcpError::IoError(io::Error::other(
                 "accept channel closed unexpectedly",
             ))),
         }
@@ -181,9 +180,7 @@ impl KcpListener {
 
     pub fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<KcpResult<(KcpStream, SocketAddr)>> {
         self.accept_rx.poll_recv(cx).map(|op_res| {
-            op_res.ok_or_else(|| {
-                KcpError::IoError(io::Error::new(ErrorKind::Other, "accept channel closed unexpectedly"))
-            })
+            op_res.ok_or_else(|| KcpError::IoError(io::Error::other("accept channel closed unexpectedly")))
         })
     }
 

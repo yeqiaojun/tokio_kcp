@@ -1,6 +1,6 @@
 use std::{
     fmt::{self, Debug},
-    io::{self, ErrorKind},
+    io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
@@ -117,12 +117,27 @@ impl KcpStream {
         result.into()
     }
 
-    /// `send` data in `buf`
+    /// Sends all data in `buf`.
+    ///
+    /// Large buffers can be split across multiple KCP messages. Callers using
+    /// `recv` directly may need repeated reads to receive the whole buffer.
     pub async fn send(&mut self, buf: &[u8]) -> KcpResult<usize> {
-        future::poll_fn(|cx| self.poll_send(cx, buf)).await
+        if buf.is_empty() {
+            return future::poll_fn(|cx| self.poll_send(cx, buf)).await;
+        }
+
+        let mut sent = 0;
+        while sent < buf.len() {
+            sent += future::poll_fn(|cx| self.poll_send(cx, &buf[sent..])).await?;
+        }
+        Ok(sent)
     }
 
-    /// `recv` data into `buf`
+    /// Receives data into `buf`.
+    ///
+    /// This returns after one readable chunk. Large buffers sent by `send` may
+    /// require repeated `recv` calls, or `AsyncReadExt::read_exact` with an
+    /// upper-layer length prefix.
     pub fn poll_recv(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<KcpResult<usize>> {
         loop {
             // Consumes all data in buffer
@@ -172,7 +187,7 @@ impl KcpStream {
         }
     }
 
-    /// `recv` data into `buf`
+    /// Receives data into `buf`.
     pub async fn recv(&mut self, buf: &mut [u8]) -> KcpResult<usize> {
         future::poll_fn(|cx| self.poll_recv(cx, buf)).await
     }
@@ -191,7 +206,7 @@ impl AsyncRead for KcpStream {
                 Ok(()).into()
             }
             Err(KcpError::IoError(err)) => Err(err).into(),
-            Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
+            Err(err) => Err(io::Error::other(err)).into(),
         }
     }
 }
@@ -201,7 +216,7 @@ impl AsyncWrite for KcpStream {
         match ready!(self.poll_send(cx, buf)) {
             Ok(n) => Ok(n).into(),
             Err(KcpError::IoError(err)) => Err(err).into(),
-            Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
+            Err(err) => Err(io::Error::other(err)).into(),
         }
     }
 
@@ -213,7 +228,7 @@ impl AsyncWrite for KcpStream {
                 Ok(()).into()
             }
             Err(KcpError::IoError(err)) => Err(err).into(),
-            Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
+            Err(err) => Err(io::Error::other(err)).into(),
         }
     }
 
@@ -240,9 +255,13 @@ impl std::os::windows::io::AsRawSocket for KcpStream {
 
 #[cfg(test)]
 mod test {
-    use crate::KcpListener;
+    use crate::{KcpListener, KcpNoDelayConfig};
 
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        time::{timeout, Duration},
+    };
 
     #[tokio::test]
     async fn test_stream_echo() {
@@ -251,7 +270,7 @@ mod test {
         let config = KcpConfig::default();
         let server_addr = "127.0.0.1:5555".parse::<SocketAddr>().unwrap();
 
-        let mut listener = KcpListener::bind(config.clone(), server_addr).await.unwrap();
+        let mut listener = KcpListener::bind(config, server_addr).await.unwrap();
         let listener_hdl = tokio::spawn(async move {
             loop {
                 let (mut stream, peer_addr) = listener.accept().await.unwrap();
@@ -289,5 +308,295 @@ mod test {
         assert_eq!(&recv_buffer[..recv_n], test_payload);
 
         listener_hdl.abort();
+    }
+
+    #[tokio::test]
+    async fn write_all_handles_large_stream_buffers() {
+        let config = KcpConfig {
+            stream: true,
+            ..KcpConfig::default()
+        };
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![17; 200 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            timeout(Duration::from_secs(5), stream.read_exact(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_all_handles_large_buffers_with_custom_mtu() {
+        let config = KcpConfig {
+            mtu: 700,
+            nodelay: KcpNoDelayConfig::fastest(),
+            flush_write: true,
+            flush_acks_input: true,
+            ..KcpConfig::default()
+        };
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![23; 200 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            timeout(Duration::from_secs(5), stream.read_exact(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_all_handles_large_buffers_with_fec() {
+        let config = KcpConfig {
+            nodelay: KcpNoDelayConfig::fastest(),
+            flush_write: true,
+            flush_acks_input: true,
+            ..KcpConfig::default().with_fec(2, 1)
+        };
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![29; 200 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            timeout(Duration::from_secs(5), stream.read_exact(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_handles_large_buffers() {
+        let config = KcpConfig {
+            nodelay: KcpNoDelayConfig::fastest(),
+            flush_write: true,
+            flush_acks_input: true,
+            ..KcpConfig::default()
+        };
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![31; 200 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            timeout(Duration::from_secs(5), stream.read_exact(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+        let sent = stream.send(&payload).await.unwrap();
+        assert_eq!(sent, payload.len());
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_handles_large_buffers_with_default_config() {
+        let config = KcpConfig::default();
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![33; 200 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            timeout(Duration::from_secs(5), stream.read_exact(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+        let sent = stream.send(&payload).await.unwrap();
+        assert_eq!(sent, payload.len());
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_handles_very_large_buffers_with_default_config() {
+        let config = KcpConfig::default();
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![39; 600 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            timeout(Duration::from_secs(10), stream.read_exact(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+        let sent = timeout(Duration::from_secs(10), stream.send(&payload))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent, payload.len());
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_with_server_allocated_conv_handles_large_buffers() {
+        let config = KcpConfig::default();
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![41; 200 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            timeout(Duration::from_secs(10), stream.read_exact(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect_with_conv(&config, 0, server_addr).await.unwrap();
+        let sent = timeout(Duration::from_secs(10), stream.send(&payload))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent, payload.len());
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_handles_large_stream_buffers() {
+        let config = KcpConfig {
+            stream: true,
+            nodelay: KcpNoDelayConfig::fastest(),
+            flush_write: true,
+            flush_acks_input: true,
+            ..KcpConfig::default()
+        };
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![43; 200 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            timeout(Duration::from_secs(5), stream.read_exact(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+        let sent = stream.send(&payload).await.unwrap();
+        assert_eq!(sent, payload.len());
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_large_buffer_can_be_read_by_repeated_recv() {
+        let config = KcpConfig {
+            nodelay: KcpNoDelayConfig::fastest(),
+            flush_write: true,
+            flush_acks_input: true,
+            ..KcpConfig::default()
+        };
+
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let payload = vec![37; 200 * 1024];
+        let expected = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; expected.len()];
+            let mut received = 0;
+
+            let first = timeout(Duration::from_secs(5), stream.recv(&mut buffer[received..]))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(first > 0 && first < expected.len());
+            received += first;
+
+            while received < expected.len() {
+                let n = timeout(Duration::from_secs(5), stream.recv(&mut buffer[received..]))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(n > 0);
+                received += n;
+            }
+
+            assert_eq!(buffer, expected);
+        });
+
+        let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+        let sent = stream.send(&payload).await.unwrap();
+        assert_eq!(sent, payload.len());
+        stream.flush().await.unwrap();
+
+        server.await.unwrap();
     }
 }

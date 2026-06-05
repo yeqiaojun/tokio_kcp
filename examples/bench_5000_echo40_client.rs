@@ -117,6 +117,7 @@ fn parse_period(value: &str) -> Duration {
     Duration::from_secs(value.parse::<u64>().unwrap())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_client(
     server_addr: SocketAddr,
     id: usize,
@@ -164,17 +165,18 @@ async fn run_client(
 }
 
 fn bench_config() -> KcpConfig {
-    let mut config = KcpConfig::default();
-    config.nodelay = KcpNoDelayConfig {
-        nodelay: true,
-        interval: 50,
-        resend: 2,
-        nc: false,
-    };
-    config.wnd_size = (128, 128);
-    config.flush_write = true;
-    config.flush_acks_input = false;
-    config
+    KcpConfig {
+        nodelay: KcpNoDelayConfig {
+            nodelay: true,
+            interval: 50,
+            resend: 2,
+            nc: false,
+        },
+        wnd_size: (128, 128),
+        flush_write: true,
+        flush_acks_input: false,
+        ..KcpConfig::default()
+    }
 }
 
 fn first_send_jitter(id: usize, period: Duration) -> Duration {

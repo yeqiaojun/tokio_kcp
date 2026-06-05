@@ -435,17 +435,18 @@ fn first_delay(index: usize, sessions: usize, interval: Duration) -> Duration {
 }
 
 fn bench_config() -> KcpConfig {
-    let mut config = KcpConfig::default();
-    config.nodelay = KcpNoDelayConfig {
-        nodelay: true,
-        interval: 50,
-        resend: 2,
-        nc: false,
-    };
-    config.wnd_size = (128, 128);
-    config.flush_write = true;
-    config.flush_acks_input = false;
-    config
+    KcpConfig {
+        nodelay: KcpNoDelayConfig {
+            nodelay: true,
+            interval: 50,
+            resend: 2,
+            nc: false,
+        },
+        wnd_size: (128, 128),
+        flush_write: true,
+        flush_acks_input: false,
+        ..KcpConfig::default()
+    }
 }
 
 fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -471,6 +472,7 @@ fn worker_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn format_duration(duration: Duration) -> String {
     if duration.subsec_nanos() == 0 {
         return format!("{}s", duration.as_secs());
@@ -488,7 +490,7 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn boxed_error(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
-    Box::new(io::Error::new(io::ErrorKind::Other, message.into()))
+    Box::new(io::Error::other(message.into()))
 }
 
 fn print_usage() {

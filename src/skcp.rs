@@ -18,6 +18,8 @@ use crate::{
 };
 
 const OUTPUT_BACKLOG: usize = 2048;
+// kcp 0.5.3 rejects messages with 128 or more fragments.
+const MAX_SEND_SEGMENTS: usize = 127;
 
 /// Writer for sending packets to the underlying UdpSocket
 struct UdpOutput {
@@ -98,6 +100,8 @@ pub struct KcpSocket {
     socket: Arc<UdpSocket>,
     flush_write: bool,
     flush_ack_input: bool,
+    first_send_chunk_len: usize,
+    max_send_chunk_len: usize,
     sent_first: bool,
     pending_sender: Option<Waker>,
     pending_receiver: Option<Waker>,
@@ -123,6 +127,8 @@ impl KcpSocket {
             Kcp::new(conv, output)
         };
         c.apply_config(&mut kcp);
+        let first_send_chunk_len = kcp.mss();
+        let max_send_chunk_len = first_send_chunk_len * MAX_SEND_SEGMENTS;
 
         // Ask server to allocate one
         if conv == 0 {
@@ -139,6 +145,8 @@ impl KcpSocket {
             socket,
             flush_write: c.flush_write,
             flush_ack_input: c.flush_acks_input,
+            first_send_chunk_len,
+            max_send_chunk_len,
             sent_first: false,
             pending_sender: None,
             pending_receiver: None,
@@ -230,8 +238,13 @@ impl KcpSocket {
             return Poll::Pending;
         }
 
-        if !self.sent_first && self.kcp.waiting_conv() && buf.len() > self.kcp.mss() {
-            buf = &buf[..self.kcp.mss()];
+        let max_send_len = if !self.sent_first && self.kcp.waiting_conv() {
+            self.first_send_chunk_len
+        } else {
+            self.max_send_chunk_len
+        };
+        if buf.len() > max_send_len {
+            buf = &buf[..max_send_len];
         }
 
         let n = self.kcp.send(buf)?;
@@ -412,8 +425,63 @@ mod test {
     use std::sync::Arc;
     use tokio::{net::UdpSocket, sync::Mutex, time};
 
-    use super::KcpSocket;
-    use crate::config::KcpConfig;
+    use super::{KcpSocket, MAX_SEND_SEGMENTS};
+    use crate::{config::KcpConfig, fec::FEC_HEADER_SIZE_PLUS_SIZE};
+
+    async fn new_test_socket(config: &KcpConfig, conv: u32) -> KcpSocket {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        KcpSocket::new(config, conv, socket, target.local_addr().unwrap(), false).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_chunk_lengths_follow_configured_mss() {
+        let default_config = KcpConfig::default();
+        let default_socket = new_test_socket(&default_config, 1).await;
+
+        let custom_config = KcpConfig {
+            mtu: 700,
+            ..KcpConfig::default()
+        };
+        let custom_socket = new_test_socket(&custom_config, 1).await;
+
+        let fec_config = KcpConfig {
+            mtu: 700,
+            ..KcpConfig::default().with_fec(2, 1)
+        };
+        let fec_socket = new_test_socket(&fec_config, 1).await;
+
+        assert_eq!(custom_socket.first_send_chunk_len, custom_socket.kcp.mss());
+        assert_eq!(custom_socket.max_send_chunk_len, custom_socket.kcp.mss() * 127);
+        assert_eq!(
+            custom_socket.max_send_chunk_len,
+            custom_socket.first_send_chunk_len * MAX_SEND_SEGMENTS
+        );
+        assert_eq!(
+            default_socket.first_send_chunk_len - custom_socket.first_send_chunk_len,
+            default_config.mtu - custom_config.mtu
+        );
+        assert_eq!(
+            custom_socket.first_send_chunk_len - fec_socket.first_send_chunk_len,
+            FEC_HEADER_SIZE_PLUS_SIZE
+        );
+    }
+
+    #[tokio::test]
+    async fn send_caps_waiting_conv_and_large_messages() {
+        let config = KcpConfig::default();
+
+        let mut waiting_conv_socket = new_test_socket(&config, 0).await;
+        let first_payload = vec![1; waiting_conv_socket.first_send_chunk_len + 1];
+        let sent = waiting_conv_socket.send(&first_payload).await.unwrap();
+        assert_eq!(sent, waiting_conv_socket.first_send_chunk_len);
+
+        let mut socket = new_test_socket(&config, 1).await;
+        let payload = vec![2; socket.max_send_chunk_len + 1];
+        let sent = socket.send(&payload).await.unwrap();
+        assert_eq!(sent, socket.max_send_chunk_len);
+    }
 
     #[tokio::test]
     async fn kcp_echo() {
