@@ -1,12 +1,12 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     fmt::{self, Debug},
     io::ErrorKind,
     net::SocketAddr,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -18,7 +18,7 @@ use spin::Mutex as SpinMutex;
 use spin::MutexGuard as SpinMutexGuard;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
 
-use crate::{fec, scheduler::session_scheduler, skcp::KcpSocket, KcpConfig};
+use crate::{KcpConfig, fec, scheduler::session_scheduler, skcp::KcpSocket};
 
 pub struct KcpSession {
     socket: SpinMutex<KcpSocket>,
@@ -379,9 +379,7 @@ impl KcpSessionManager {
                     let old_conv = old_session.conv().await;
                     trace!(
                         "replaced session with conv: {} (old: {}), peer: {}",
-                        conv,
-                        old_conv,
-                        peer_addr
+                        conv, old_conv, peer_addr
                     );
 
                     Ok((session, true))

@@ -1,6 +1,7 @@
 use std::sync::{
+    Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
-    mpsc, Arc, OnceLock,
+    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};

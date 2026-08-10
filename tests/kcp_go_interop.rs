@@ -9,7 +9,7 @@ use std::{
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    time::{timeout, Duration},
+    time::{Duration, timeout},
 };
 use tokio_kcp::{KcpListener, KcpStream};
 

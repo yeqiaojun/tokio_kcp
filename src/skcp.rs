@@ -12,9 +12,9 @@ use log::{error, trace};
 use tokio::{net::UdpSocket, sync::mpsc};
 
 use crate::{
+    KcpConfig,
     fec::{self, FecDecoder, FecEncoder},
     utils::now_millis_u64,
-    KcpConfig,
 };
 
 const OUTPUT_BACKLOG: usize = 2048;

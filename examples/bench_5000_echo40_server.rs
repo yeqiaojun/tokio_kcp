@@ -2,8 +2,8 @@ use std::{
     env,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -67,7 +67,7 @@ async fn main() {
     let mut stop = run_for.map(|duration| Box::pin(time::sleep(duration)));
 
     loop {
-        let (mut stream, _) = if let Some(stop) = stop.as_mut() {
+        let accepted_stream = if let Some(stop) = stop.as_mut() {
             tokio::select! {
                 _ = stop.as_mut() => break,
                 accepted = listener.accept() => accepted.unwrap(),
@@ -75,6 +75,7 @@ async fn main() {
         } else {
             listener.accept().await.unwrap()
         };
+        let (mut stream, _) = accepted_stream;
         accepted.fetch_add(1, Ordering::Relaxed);
         active.fetch_add(1, Ordering::Relaxed);
 

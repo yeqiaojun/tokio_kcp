@@ -2,15 +2,15 @@ use std::{
     env,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, Semaphore},
+    sync::{Semaphore, mpsc},
     time::timeout,
 };
 use tokio_kcp::{KcpConfig, KcpListener, KcpStream};

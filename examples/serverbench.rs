@@ -5,15 +5,15 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{watch, Semaphore},
+    sync::{Semaphore, watch},
     time,
 };
 use tokio_kcp::{KcpConfig, KcpListener, KcpNoDelayConfig, KcpStream};
@@ -209,8 +209,10 @@ async fn connect_and_warmup(
         let permit = semaphore.clone().acquire_owned().await?;
         let payload = payload.clone();
         handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            warmup_one(addr, index, payload, timeout).await
+            let permit = permit;
+            let result = warmup_one(addr, index, payload, timeout).await;
+            drop(permit);
+            result
         }));
     }
 

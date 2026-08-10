@@ -260,7 +260,7 @@ mod test {
     use super::*;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        time::{timeout, Duration},
+        time::{Duration, timeout},
     };
 
     #[tokio::test]

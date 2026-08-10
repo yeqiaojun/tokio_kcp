@@ -2,8 +2,8 @@ use std::{
     env,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -11,7 +11,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::Semaphore,
-    time::{interval, interval_at, timeout, Instant as TokioInstant},
+    time::{Instant as TokioInstant, interval, interval_at, timeout},
 };
 use tokio_kcp::{KcpConfig, KcpNoDelayConfig, KcpStream};
 
